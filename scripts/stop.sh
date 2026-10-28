@@ -5,7 +5,7 @@ load_config
 container_exists || { info "$CONTAINER does not exist"; exit 0; }
 if [[ $(docker inspect -f '{{.State.Running}}' "$CONTAINER") == true ]]; then
     if docker exec "$CONTAINER" bash -c 'for comm in /proc/[0-9]*/comm; do
-        if [[ $(<"$comm") == strata-host ]]; then
+        if [[ $(<"$comm") == strata-host || $(<"$comm") == strata ]]; then
             pid=${comm#/proc/}
             printf "STOP\nQUIT\n" > "/proc/${pid%/comm}/fd/0"
             exit 0

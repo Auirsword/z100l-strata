@@ -24,8 +24,8 @@ load_config() {
     [[ "$PACK_JOBS" =~ ^[1-9][0-9]*$ ]] || die "PACK_JOBS must be positive"
     [[ "$STOP_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "STOP_TIMEOUT must be positive"
     [[ "$CHECK_MODEL_HASH" == 0 || "$CHECK_MODEL_HASH" == 1 ]] || die "CHECK_MODEL_HASH must be 0 or 1"
-    [[ "$DOCKER_APPARMOR" == default || "$DOCKER_APPARMOR" == unconfined ]] ||
-        die "DOCKER_APPARMOR must be default or unconfined"
+    [[ "$DOCKER_APPARMOR" == default || "$DOCKER_APPARMOR" == unconfined || "$DOCKER_APPARMOR" == z100l-strata ]] ||
+        die "DOCKER_APPARMOR must be z100l-strata, default or unconfined"
     [[ "$RESTART_POLICY" == no || "$RESTART_POLICY" == unless-stopped || "$RESTART_POLICY" == always ]] ||
         die "unsupported RESTART_POLICY"
     [[ "$PUBLISH_HOST" != *[[:space:]]* ]] || die "PUBLISH_HOST cannot contain whitespace"

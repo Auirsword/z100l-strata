@@ -10,6 +10,9 @@ an official Hygon, AMD, Qwen, or Strata release.
 - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp): MIT License.
   Strata uses ggml for quantization formats and CPU expert dot products; the
   main Strata engine is not a llama.cpp fork.
+- [Moby / Docker](https://github.com/moby/moby): Apache-2.0 License. The
+  AppArmor profile is derived from the Docker v26 base template, with explicit
+  TCP, UDP, and Unix stream rules for DTK. Its license is in `security/LICENSE.moby`.
 - Model weights and the Hygon DTK are **not bundled**. Users obtain them from
   their respective publishers and are responsible for their license terms.
 - The selected model card declares Apache-2.0. Its abliterated/refusal-removed

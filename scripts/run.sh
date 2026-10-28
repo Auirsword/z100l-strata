@@ -17,10 +17,13 @@ else
         [[ -e "$device" ]] && devices+=(--device="$device")
     done
 fi
+"$ROOT_DIR/scripts/apparmor.sh"
 security=(--cap-drop ALL --security-opt no-new-privileges:true)
 if [[ "$DOCKER_APPARMOR" == unconfined ]]; then
     info "AppArmor unconfined selected explicitly; seccomp remains enabled"
     security+=(--security-opt apparmor=unconfined)
+elif [[ "$DOCKER_APPARMOR" != default ]]; then
+    security+=(--security-opt "apparmor=$DOCKER_APPARMOR")
 fi
 [[ "$PUBLISH_HOST" == 127.0.0.1 || "$PUBLISH_HOST" == ::1 ]] ||
     info "warning: the unauthenticated development endpoint will listen on $PUBLISH_HOST"

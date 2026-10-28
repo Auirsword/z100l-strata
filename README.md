@@ -49,7 +49,9 @@ BUILD_JOBS=4
 PACK_JOBS=4
 ```
 
-`GPU_ID` 是 HIP 逻辑设备序号，不等同于 PCI BDF。需要指定渲染节点时可设置 `GPU_RENDER_DEVICE=/dev/dri/renderD...`，否则暴露本机 DRI 节点。PVE/AppArmor 环境若已确认需要，可显式设置 `DOCKER_APPARMOR=unconfined`；默认不关闭 AppArmor 或 seccomp，不使用 `--privileged`。
+`GPU_ID` 是 HIP 逻辑设备序号，不等同于 PCI BDF。需要指定渲染节点时可设置 `GPU_RENDER_DEVICE=/dev/dri/renderD...`，否则暴露本机 DRI 节点。DTK 需要创建 Unix stream socket，部分 Docker 的 `docker-default` AppArmor 配置会将其拒绝，导致 `no ROCm-capable device is detected`。因此 `run.sh` 默认通过 `apparmor_parser` 加载本仓库的 `z100l-strata` 专用配置，需要 root 或 sudo；它基于 Docker v26 默认配置，只开放 TCP、UDP 和 Unix stream 网络能力。PVE 9 等新内核还要求按 `/sys/kernel/security/apparmor/features` 的当前特性编译，脚本已处理，不覆盖 `docker-default` 或全局 `parser.conf`。AppArmor 未启用时不会加载。
+
+容器仍使用 Docker 默认 seccomp、去掉全部 capabilities、只读根文件系统，不使用 `--privileged`。也可显式选择 `DOCKER_APPARMOR=default`（部分发行版不支持 DTK）或 `DOCKER_APPARMOR=unconfined`（不建议，明显削弱隔离）。若需卸载已加载的专用配置，以 root 执行 `apparmor_parser --remove security/z100l-strata.apparmor`。
 
 默认 `DOCKER_NETWORK=bridge`，只发布到宿主 `127.0.0.1`。若宿主 Docker 的端口映射不可用，可设置 `DOCKER_NETWORK=host` 并重新运行 `configure.sh`；此时服务仍只绑定 `PUBLISH_HOST=127.0.0.1`，不会监听局域网。只有在您明确需要暴露服务时才修改该地址。
 

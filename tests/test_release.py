@@ -17,6 +17,14 @@ class ReleaseTest(unittest.TestCase):
             self.assertNotIn("--network=host", text)
             self.assertNotIn("--cap-add", text)
 
+    def test_dtk_apparmor_profile_keeps_container_boundaries(self):
+        profile = (ROOT / "security/z100l-strata.apparmor").read_text()
+        self.assertIn("profile z100l-strata", profile)
+        self.assertIn("network unix stream,", profile)
+        self.assertIn("deny mount,", profile)
+        self.assertNotIn("network,", profile)
+        self.assertIn('DOCKER_APPARMOR=z100l-strata', (ROOT / "config/default.env").read_text())
+
     def test_no_local_deployment_artifacts(self):
         forbidden = re.compile(r"(?i)192\.168\.|100\.102\.|43\.155\.|sslip\.io|/data/build|pve\.local|core\.[0-9]+|BEGIN (?:RSA |OPENSSH )?PRIVATE KEY|(?:password|passwd|api[_-]?key|secret)[\w-]*\s*[:=]\s*[\"'][^\"'\n]+[\"']")
         for path in ROOT.rglob("*"):
