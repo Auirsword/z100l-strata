@@ -73,6 +73,7 @@ def main():
         "--kv-resident", str(min(32768, context)),
         "--prefill", "4096",
         "--spec", "4", "--spec-min-p", "0.5", "--pcie-frac", "0",
+        "--vram-reserve-mib", "1900",
         "--expert-cache", "auto",
         "--conversation-cache-mib", str(l2_mib),
         "--conversation-cache-slots", "16" if tuned else "4",
