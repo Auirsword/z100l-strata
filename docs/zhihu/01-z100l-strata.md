@@ -120,6 +120,12 @@ MTP 一次提出多个候选 token，接受率高通常有利，但生成草稿�
 
 最后是硬件安全：不要把 PCI Reset、VFIO reset 或 `hy-smi --dcureset` 当作普通排障按钮。已有 Z100L 经验表明，这类操作可能触发需要断电恢复的严重状态。公开仓库**不带 reset 或 PCI fixup 工具**，部署脚本也不会替用户尝试复位、刷固件或改虚拟化配置；相关宿主问题应按海光对应版本的官方流程单独处理。
 
+### 3.10 容器里的“没有 GPU”，可能只是 Unix socket 被拒绝
+
+公开包的独立验收还遇到过一个很有迷惑性的故障：宿主与 HIP 探针能识别显卡，Strata 却报 `no ROCm-capable device is detected`。对照容器启动参数后，关闭 seccomp 没有作用，单独关闭 AppArmor 才恢复设备枚举；内核审计最终指向 `socket(AF_UNIX, SOCK_STREAM, 0)` 被拒绝。
+
+在这台 PVE 9 主机上，单纯给规则补 `network unix stream` 仍不够：系统固定的 AppArmor 策略特性集与新内核不匹配。最终办法不是 privileged，也不是关闭全局防护，而是给这个推理容器一个独立 profile，按 `/sys/kernel/security/apparmor/features` 的当前内核特性编译，并保留 seccomp、去掉 capabilities 和只读根文件系统。这个小坑再次说明，容器、运行时和驱动要作为一整条初始化链排查。
+
 ## 4. 一键部署：公开 Auirsword/z100l-strata
 
 移植和调优结果整理在公开仓库：[https://github.com/Auirsword/z100l-strata](https://github.com/Auirsword/z100l-strata)。目标不是复制我的整台服务器，而是提供可审阅的 DTK 补丁、固定版本构建、模型准备和本地启动入口。前置条件是 x86_64 Linux、已经正常工作的 DCU 驱动与 DTK、Docker、Git、curl 和 Python 3。确认宿主能使用 GPU 后，部署入口如下：
