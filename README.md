@@ -51,6 +51,8 @@ PACK_JOBS=4
 
 `GPU_ID` 是 HIP 逻辑设备序号，不等同于 PCI BDF。需要指定渲染节点时可设置 `GPU_RENDER_DEVICE=/dev/dri/renderD...`，否则暴露本机 DRI 节点。PVE/AppArmor 环境若已确认需要，可显式设置 `DOCKER_APPARMOR=unconfined`；默认不关闭 AppArmor 或 seccomp，不使用 `--privileged`。
 
+默认 `DOCKER_NETWORK=bridge`，只发布到宿主 `127.0.0.1`。若宿主 Docker 的端口映射不可用，可设置 `DOCKER_NETWORK=host` 并重新运行 `configure.sh`；此时服务仍只绑定 `PUBLISH_HOST=127.0.0.1`，不会监听局域网。只有在您明确需要暴露服务时才修改该地址。
+
 **保守预设**：32K context、单会话、4 个 L2 槽位、32GiB L3。适合先验证安装，内存预算仍取决于模型、专家 cache、上下文和并发。
 
 **Z100L 32GB 高配预设**：与已验证的高端工作点一致，启用 262K context、batch 4、pinned arena 与 shared-expert 调优：

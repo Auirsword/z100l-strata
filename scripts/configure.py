@@ -96,7 +96,7 @@ def main():
         "model_name": "Qwen3.8-Flash-Next-IQ3_S",
         "cwd": "/opt/strata/src",
         "log": "/state/logs/engine.log",
-        "host": "0.0.0.0",
+        "host": "0.0.0.0" if os.environ.get("DOCKER_NETWORK", "bridge") == "bridge" else os.environ.get("PUBLISH_HOST", "127.0.0.1"),
         "port": 18080,
         "conversation_cache_mib": l2_mib,
         "conversation_cache_slots": 16 if tuned else 4,

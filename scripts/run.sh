@@ -33,8 +33,10 @@ if gid=$(getent group render | cut -d: -f3) && [[ $gid =~ ^[0-9]+$ ]]; then
 fi
 publish_binding="$PUBLISH_HOST:$PORT:18080"
 [[ "$PUBLISH_HOST" != *:* ]] || publish_binding="[$PUBLISH_HOST]:$PORT:18080"
+network=(--network "$DOCKER_NETWORK")
+[[ "$DOCKER_NETWORK" != bridge ]] || network+=(--publish "$publish_binding")
 exec docker run -d --name "$CONTAINER" --restart "$RESTART_POLICY" \
-    --network bridge --publish "$publish_binding" \
+    "${network[@]}" \
     --ipc private --shm-size "$SHM_SIZE" --pids-limit 512 --ulimit memlock=-1 \
     --read-only --tmpfs /tmp:rw,noexec,nosuid,size=2g \
     --tmpfs /var/log/hylog:rw,nosuid,size=64m \

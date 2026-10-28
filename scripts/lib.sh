@@ -29,8 +29,9 @@ load_config() {
     [[ "$RESTART_POLICY" == no || "$RESTART_POLICY" == unless-stopped || "$RESTART_POLICY" == always ]] ||
         die "unsupported RESTART_POLICY"
     [[ "$PUBLISH_HOST" != *[[:space:]]* ]] || die "PUBLISH_HOST cannot contain whitespace"
+    [[ "$DOCKER_NETWORK" == bridge || "$DOCKER_NETWORK" == host ]] || die "DOCKER_NETWORK must be bridge or host"
     export DATA_DIR MODEL_DIR IMAGE CONTAINER DTK_DIR HYHAL_DIR GPU_ID PUBLISH_HOST PORT
-    export BUILD_JOBS PACK_JOBS STOP_TIMEOUT RESTART_POLICY DOCKER_APPARMOR SHM_SIZE PRESET
+    export BUILD_JOBS PACK_JOBS STOP_TIMEOUT RESTART_POLICY DOCKER_APPARMOR SHM_SIZE PRESET DOCKER_NETWORK
 }
 
 container_exists() { docker container inspect "$CONTAINER" >/dev/null 2>&1; }
