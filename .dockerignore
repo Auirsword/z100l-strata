@@ -1,0 +1,14 @@
+.git
+**/.git
+.env
+.work/**/.git
+.work/models
+.state
+state
+**/__pycache__
+*.gguf
+*.session
+*.log
+core
+core.*
+docs/zhihu

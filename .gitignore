@@ -1,0 +1,30 @@
+# Local configuration and credentials
+.env
+*.local
+*.pem
+*.key
+secrets/
+
+# Source checkouts and build products
+.work/
+.build/
+build/
+dist/
+
+# Model weights, packs, conversations and logs
+*.gguf
+*.session
+*.bin
+*.sqlite*
+*.db
+*.log
+core
+core.*
+state/
+models/pack/
+
+# Tool caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.cache/

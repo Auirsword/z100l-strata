@@ -1,0 +1,1197 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 0cde7e5..bdbd5e4 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -162,6 +162,10 @@ if(STRATA_HIP_GFX906)
+   set(CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/platform/hip_compat)
+   include_directories(BEFORE ${CMAKE_CURRENT_SOURCE_DIR}/include/strata/platform/hip_compat)
+   add_compile_definitions(STRATA_HIP_GFX906=1)
++  # DTK-26.10 defaults kernels without __launch_bounds__ to 256 threads on gfx906 and refuses wider
++  # launches; the engine launches several kernels at 512/1024. Raise the default cap (verified: 1024-thread
++  # blocks with full-block LDS reductions run correctly on Z100L).
++  add_compile_options($<$<COMPILE_LANGUAGE:HIP>:--gpu-max-threads-per-block=1024>)
+   message(STATUS "Strata: HIP (gfx906 compat) enabled, arch ${CMAKE_HIP_ARCHITECTURES}")
+   set(_strata_gpu_runtime_target CUDA::cudart)
+   set(_strata_gpu_blas_target CUDA::cublas)
+@@ -584,7 +588,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+     src/core/remote_expert_opt.cu
+     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
+     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
+-    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
++    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp src/core/conversation_l3.cpp)
+   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
+diff --git a/include/strata/core/conversation_cache.hpp b/include/strata/core/conversation_cache.hpp
+index b2e6a74..673f6f9 100644
+--- a/include/strata/core/conversation_cache.hpp
++++ b/include/strata/core/conversation_cache.hpp
+@@ -9,6 +9,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <deque>
++#include <functional>
+ #include <utility>
+ #include <vector>
+ 
+@@ -209,6 +210,12 @@ public:
+ 
+     ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0)
+         : budget_(budget), slots_(slots), min_tokens_(min_tokens) {}
++    /// L3 disk archive (conversation_l3.hpp): when set, evict_oldest() hands the evicted image to this sink BEFORE
++    /// erasing it, so a parked conversation the RAM budget pushes out can be written to SSD and found again on a
++    /// later miss.  nullptr (the default) keeps the old behavior - an evicted conversation is gone.  Only
++    /// evict_oldest() reports: drop_superseded() (a copy the outgoing chain still holds) and clear() (#879:
++    /// possibly poisoned) never archive.  The callback must not throw and must not call back into this cache.
++    std::function<void(SavedConversation&&)> on_archive;
+     bool enabled() const { return budget_ != 0 && slots_ != 0; }
+     /// `--conversation-cache-min-tokens`: whether a conversation of this length is worth one of `slots`.  Every
+     /// parked conversation costs a whole slot whatever its length, so a client that interleaves short side requests
+@@ -342,7 +349,9 @@ public:
+         // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
+         for (size_t i = 0; i < entries_.size(); ++i) {
+             if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+-            bytes_ -= entries_[i].bytes();
++            const size_t nbytes = entries_[i].bytes();   // taken before the move below empties the entry
++            if (on_archive) on_archive(std::move(entries_[i]));   // the L3 disk archive gets the evicted image
++            bytes_ -= nbytes;
+             erase(i);
+             ++evictions_;
+             return true;
+diff --git a/include/strata/core/conversation_l3.hpp b/include/strata/core/conversation_l3.hpp
+new file mode 100644
+index 0000000..7eef680
+--- /dev/null
++++ b/include/strata/core/conversation_l3.hpp
+@@ -0,0 +1,137 @@
++// SSD persistence for parked conversations (the L3 archive): the RAM ConversationCache hands every conversation it
++// evicts to a ConversationL3Store, which writes it as an ordinary session file (conversation_file.hpp - the same
++// format as SAVE) plus a small index sidecar; a RAM-cache miss asks find_best() for the longest archived prefix of
++// the new prompt and load()s it back into the RAM cache.  Pure host code, batch-safe: it only ever moves
++// SavedConversation images.  Files from an earlier run of the engine are picked up at construction, so a restarted
++// engine keeps its archive.  bump_generation() voids the whole archive after non-finite logits (#879): an image
++// captured before the flush may carry the poison, so every file goes, not just the ones written since.
++#pragma once
++
++#include "strata/core/conversation_file.hpp"
++
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <string>
++#include <type_traits>
++#include <vector>
++
++namespace strata::core {
++
++class ConversationL3Store {
++public:
++    // What a write/read binds the file to (the engine's model and config fingerprints) and the bounds a read
++    // checks before it allocates - the engine fills both from its runtime, as for SAVE/RESTORE.
++    using IdentityFn = std::function<bool(SessionFileIdentity& id, std::string& error)>;
++    using LimitsFn = std::function<bool(SessionReadLimits& limits, std::string& error)>;
++    using LogFn = std::function<void(const std::string& message)>;
++
++    // One matchable prefix of an archived conversation: a token count, the 64-bit hash of the tokens (as int32_t
++    // bytes), and the images below that length.  Public: the sidecar helpers read and write keys.
++    struct Key {
++        uint64_t tokens = 0, ids_hash = 0;
++        std::vector<ConversationImageKey> imgs;
++    };
++
++    // Scans `dir` (created when missing): every complete strata-l3-*.session with a readable sidecar joins the
++    // index, least recently modified first; an over-budget archive loses its least recently used files at once.
++    ConversationL3Store(std::string dir, uint64_t budget_bytes, IdentityFn identity, LimitsFn limits, LogFn log);
++
++    bool enabled() const { return !dir_.empty(); }
++    size_t size() const { return entries_.size(); }
++    uint64_t bytes() const { return bytes_; }
++    uint64_t generation() const { return generation_; }
++
++    // Extra knobs of every archive write (the progress/phase hooks keep the engine's watchdog informed; the
++    // session-file defaults of the other fields apply).  Set by the caller once, before the first archive().
++    SessionWriteOptions write_options;
++
++    // The cache's evicted image becomes dir_/strata-l3-<...>.session (sidecar <...>.session.idx).  Over budget,
++    // the least recently used archived files go first (unlink).  False - nothing indexed - on any I/O or identity
++    // failure, for a layer-split image (stage_images: the session format holds one GPU's image), for an empty live
++    // state, and for an image bigger than the whole budget.  An image already archived (same live length, ids
++    // hash, images and cvec) only refreshes the entry's LRU stamp: the bytes on disk are that same state.  Never
++    // throws; the engine keeps serving when the disk archive fails.
++    bool archive(SavedConversation&& image) noexcept;
++
++    // The longest archived prefix of (prompt, images) with this cvec, over each entry's live state AND its
++    // checkpoints - the same candidates the RAM cache's best() considers.  The checkpoints matter: the live token
++    // list can end past the client's rendered history (a speculative window commits its bonus token without
++    // reporting it), so the client-reconstructable prefix is usually the turn checkpoint.  The acceptance rule is
++    // the RAM cache's conversation_prefix(), with the saved token list checked by a 64-bit hash kept in the
++    // sidecar (the caller re-checks the loaded image's tokens exactly before using it).  The hash is over the
++    // tokens as int32_t (the saved representation), whatever integer type the prompt buffer uses.  Ties prefer
++    // the most recently used entry.  0 when nothing matches; on a hit `path` is the file to load().
++    template<class Token>
++    int64_t find_best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images,
++                      bool cvec, std::string& path) const {
++        static_assert(std::is_integral<Token>::value, "token ids are integers");
++        int64_t best_tokens = 0;
++        uint64_t best_lru = 0;
++        for (const Entry& e : entries_) {
++            if (e.cvec != cvec || e.generation != generation_) continue;
++            int64_t n = match(e.live, prompt, images);
++            for (const Key& k : e.checkpoints) n = std::max(n, match(k, prompt, images));
++            if (n > best_tokens || (n == best_tokens && n > 0 && e.lru > best_lru)) {
++                best_tokens = n;
++                best_lru = e.lru;
++                path = e.path;
++            }
++        }
++        return best_tokens;
++    }
++
++    // Reads an archived file back (session_file_read: identity, bounded parse, payload hash).  A hit refreshes the
++    // entry's LRU stamp.  False with `error` on any failure; `image` is then untouched.  Never throws.
++    bool load(const std::string& path, SavedConversation& image, std::string& error) noexcept;
++
++    // #879: everything archived so far may hold the poison the flush just dropped from RAM - delete every file and
++    // start a new generation.  A file that cannot be removed stays on disk but is out of the index.
++    void bump_generation() noexcept;
++
++private:
++    struct Entry {
++        std::string path;   // the .session file; the sidecar is path + ".idx"
++        uint64_t bytes = 0, lru = 0, generation = 0;
++        Key live;
++        std::vector<Key> checkpoints;
++        bool cvec = false;
++    };
++
++    // conversation_prefix() with the token list checked by its hash: the saved ids must be a proper prefix of the
++    // prompt (the last prompt token starts the next verify window), with the same images below them.
++    template<class Token>
++    int64_t match(const Key& k, const std::vector<Token>& prompt,
++                  const std::vector<ConversationImageKey>& images) const {
++        const size_t n = (size_t) k.tokens;
++        if (n == 0 || n >= prompt.size()) return 0;
++        SessionHasher h(0);   // streaming and one-shot agree: the archive hashed the int32_t vector's bytes
++        for (size_t i = 0; i < n; ++i) {
++            const int32_t t = (int32_t) prompt[i];
++            h.update(&t, sizeof t);
++        }
++        if (h.digest() != k.ids_hash) return 0;
++        size_t j = 0;
++        for (const auto& image : images) {
++            if (image.start >= (int64_t) n) continue;
++            if (j == k.imgs.size() || !(k.imgs[j++] == image)) return 0;
++        }
++        return j == k.imgs.size() ? (int64_t) n : 0;
++    }
++
++    void scan();
++    bool write_sidecar(const Entry& e, std::string& error) const;
++    bool read_sidecar(const std::string& session_path, Entry& e) const;
++    void evict_lru();   // removes the lowest-lru entry and its files
++    static std::string sidecar_path(const std::string& path) { return path + ".idx"; }
++    void say(const std::string& message) const { if (log_) log_(message); }
++
++    std::string dir_;
++    uint64_t budget_ = 0, bytes_ = 0, clock_ = 0, generation_ = 0, serial_ = 0;
++    IdentityFn identity_;
++    LimitsFn limits_;
++    LogFn log_;
++    std::vector<Entry> entries_;   // arbitrary order; `lru` is the recency stamp
++};
++
++} // namespace strata::core
+diff --git a/include/strata/core/expert_cache.hpp b/include/strata/core/expert_cache.hpp
+index 9685aa4..cfe088b 100644
+--- a/include/strata/core/expert_cache.hpp
++++ b/include/strata/core/expert_cache.hpp
+@@ -234,7 +234,7 @@ public:
+     }
+ 
+ private:
+-#if defined(STRATA_USE_HIP)
++#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+     bool ensure_blocking_staging(std::size_t bytes, std::string& err);
+     uint8_t* blocking_staging_ = nullptr;
+     std::size_t blocking_staging_bytes_ = 0;
+diff --git a/include/strata/platform/hip_compat/strata_hip.h b/include/strata/platform/hip_compat/strata_hip.h
+index 180a1f6..7d8890d 100644
+--- a/include/strata/platform/hip_compat/strata_hip.h
++++ b/include/strata/platform/hip_compat/strata_hip.h
+@@ -89,7 +89,9 @@
+ // the plain per-block limit (64 KB of LDS on gfx906).
+ inline hipError_t strata_device_get_attribute(int* v, hipDeviceAttribute_t a, int dev) {
+     hipError_t e = hipDeviceGetAttribute(v, a, dev);
+-    if (e == hipSuccess && a == hipDeviceAttributeSharedMemPerBlockOptin && *v <= 0)
++    // DTK-26.10: SharedMemPerBlockOptin returns "invalid argument" (not merely 0), so fall back on
++    // error too, not just on a non-positive value (z100l-strata-port journal 2026-10-24).
++    if (a == hipDeviceAttributeSharedMemPerBlockOptin && (e != hipSuccess || *v <= 0))
+         e = hipDeviceGetAttribute(v, hipDeviceAttributeMaxSharedMemoryPerBlock, dev);
+     return e;
+ }
+@@ -130,6 +132,8 @@ template <typename T> inline hipError_t strata_host_alloc(T** p, size_t bytes, u
+ #define cudaHostGetDevicePointer hipHostGetDevicePointer
+ #define cudaStreamCreate hipStreamCreate
+ #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
++#define cudaStreamCreateWithPriority hipStreamCreateWithPriority
++#define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
+ #define cudaStreamDestroy hipStreamDestroy
+ #define cudaStreamSynchronize hipStreamSynchronize
+ #define cudaStreamQuery hipStreamQuery
+@@ -146,7 +150,11 @@ template <typename T> inline hipError_t strata_host_alloc(T** p, size_t bytes, u
+ #define cudaEventSynchronize hipEventSynchronize
+ #define cudaEventElapsedTime hipEventElapsedTime
+ #define cudaGraphLaunch hipGraphLaunch
+-#define cudaGraphUpload hipGraphUpload
++// DTK-26.10: hipGraphUpload segfaults inside libgalaxyhip (z100l-strata-port journal
++// 2026-10-24). Upload is only a pre-upload optimization - hipGraphLaunch uploads lazily
++// on first launch - so make it a no-op returning success.
++inline hipError_t strata_graph_upload_noop(hipGraphExec_t, hipStream_t) { return hipSuccess; }
++#define cudaGraphUpload strata_graph_upload_noop
+ #define cudaGraphDestroy hipGraphDestroy
+ #define cudaGraphExecDestroy hipGraphExecDestroy
+ #define cudaGraphGetNodes hipGraphGetNodes
+diff --git a/serve/server.py b/serve/server.py
+index 87f5945..f7f6406 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -320,10 +320,45 @@ try:
+ except ValueError:
+     ADMIT_SHORT_FIRST = 0
+ ADMIT_MAX_WAIT_S = _timeout_env("STRATA_ADMIT_MAX_WAIT_S", 30.0) or 0.0
++# --batch topic-affinity admission (opt-in, STRATA_ADMIT_AFFINITY=1; off: whoever gets the lock first, as before):
++# a waiting new request whose prompt's token-bigram signature matches a request now in a slot (Jaccard >=
++# STRATA_ADMIT_AFFINITY_MIN, default 0.2) takes the control lines before one on a new topic - same-topic requests
++# decode together and share the expert working set (Z100L WP2: same-topic batching measured +33% total tok/s).
++# A request that waited STRATA_ADMIT_MAX_WAIT_S counts as matching (it is never held back for good).  Only the
++# admission order changes, never what is read or run.
++try:
++    ADMIT_AFFINITY = bool(int(os.environ.get("STRATA_ADMIT_AFFINITY") or 0))
++except ValueError:
++    ADMIT_AFFINITY = False
++try:
++    ADMIT_AFFINITY_MIN = float(os.environ.get("STRATA_ADMIT_AFFINITY_MIN") or 0.2)
++except ValueError:
++    ADMIT_AFFINITY_MIN = 0.2
++ADMIT_AFFINITY_DEBUG = os.environ.get("STRATA_ADMIT_AFFINITY_DEBUG") == "1"
++SIG_SKIP_TOKENS = 24        # chat-template/system head not part of the signature (shared by every request)
++SIG_BODY_TOKENS = 256       # prompt tokens after the head the signature covers
+ STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
+ STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
+ 
+ 
++def prompt_sig(ids) -> frozenset | None:
++    """A prompt's topic signature for STRATA_ADMIT_AFFINITY: the set of its token bigrams past the chat-template
++    head (that head is shared by every request and would only dilute the comparison).  None when the prompt has
++    no body to speak of - such a request never matches and simply waits its FIFO turn."""
++    body = ids[SIG_SKIP_TOKENS:SIG_SKIP_TOKENS + SIG_BODY_TOKENS]
++    if len(body) < 8:
++        return None
++    return frozenset(zip(body, body[1:]))
++
++
++def sig_match(a, b) -> float:
++    """Jaccard similarity of two prompt signatures (0..1); 0 when either side has none."""
++    if not a or not b:
++        return 0.0
++    inter = len(a & b)
++    return inter / (len(a) + len(b) - inter)
++
++
+ def engine_frozen(base: tuple[float, int], now: tuple[float, int]) -> bool:
+     """#1317: True when two (cpu seconds, io bytes) samples of the engine show no work between them."""
+     return (now[0] - base[0]) <= STALL_CPU_EPS_S and (now[1] - base[1]) <= STALL_IO_EPS_B
+@@ -1675,11 +1710,12 @@ class StrataEngine:
+ 
+     YIELDS_MAX = 2   # #656: how often one request's prompt read gives way to a shorter waiting one
+ 
+-    def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False):
++    def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False, sig=None):
+         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
+         `after_epoch`: a request whose read gave way lets the requests waiting then go first.
+-        `new`: the request's first admission (STRATA_ADMIT_SHORT_FIRST orders only these)."""
+-        entry = [plen, time.monotonic(), new]           # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST)
++        `new`: the request's first admission (STRATA_ADMIT_SHORT_FIRST orders only these).
++        `sig`: the request's prompt signature (STRATA_ADMIT_AFFINITY orders only these first admissions)."""
++        entry = [plen, time.monotonic(), new, sig]      # (length, arrival, ordered, prompt signature)
+         with self.slot_cv:
+             self.waiting += 1
+             self.wait_lens.append(entry)
+@@ -1696,13 +1732,16 @@ class StrataEngine:
+                     raise EngineDied("the engine stopped while this request waited; it was not sent")
+                 with self.slot_cv:
+                     turn = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
+-                    if turn and new and ADMIT_SHORT_FIRST > 0:
++                    if turn and new and ADMIT_AFFINITY:
++                        turn = self._admit_affinity() is entry
++                    elif turn and new and ADMIT_SHORT_FIRST > 0:
+                         turn = self._admit_next() is entry
+                 left = deadline - time.monotonic() if deadline is not None else 0.5
+                 if turn and left > 0 and self.ctl.acquire(timeout=min(0.5, left)):
+-                    if new and ADMIT_SHORT_FIRST > 0:
+-                        with self.slot_cv:              # a shorter one came while this one waited in acquire()
+-                            first = self._admit_next() is entry
++                    if new and (ADMIT_AFFINITY or ADMIT_SHORT_FIRST > 0):
++                        chooser = self._admit_affinity if ADMIT_AFFINITY else self._admit_next
++                        with self.slot_cv:              # a preferred one came while this one waited in acquire()
++                            first = chooser() is entry
+                         if not first:
+                             self.ctl.release()
+                             with self.slot_cv:
+@@ -1745,6 +1784,33 @@ class StrataEngine:
+         return min(ordered, key=lambda e: (0 if e[0] <= ADMIT_SHORT_FIRST or now - e[1] >= ADMIT_MAX_WAIT_S else 1,
+                                            e[1]))
+ 
++    def _admit_affinity(self):
++        """STRATA_ADMIT_AFFINITY=1 (the caller holds slot_cv): the new request that takes the control lines next -
++        one whose prompt signature matches a request now in a slot (same topic, a shared expert working set)
++        before one on a new topic, in arrival order within each; a request that waited STRATA_ADMIT_MAX_WAIT_S
++        counts as matching (it is never held back for good), and with the slots empty or signatureless it is
++        arrival order, as before.  Only the order changes, never what is read."""
++        now = time.monotonic()
++        ordered = [e for e in self.wait_lens if len(e) > 2 and e[2]]
++        if not ordered:
++            return None
++        act = [r["sig"] for r in self.slot_live if r and r.get("sig")]
++        if not act:
++            return min(ordered, key=lambda e: e[1])
++        ranked = []
++        for e in ordered:
++            sig = e[3] if len(e) > 3 else None
++            best = max((sig_match(sig, a) for a in act), default=0.0) if sig else 0.0
++            match = best >= ADMIT_AFFINITY_MIN or now - e[1] >= ADMIT_MAX_WAIT_S
++            ranked.append((0 if match else 1, e[1], e, best))
++        ranked.sort(key=lambda t: (t[0], t[1]))
++        if ADMIT_AFFINITY_DEBUG:
++            pick = ranked[0]
++            print(f"[strata] admit-affinity: {len(ordered)} waiting, {len(act)} in slots; "
++                  f"next waited {now - pick[2][1]:.1f}s, best-sim {pick[3]:.2f}"
++                  f"{' (fair)' if pick[0] == 0 and pick[3] < ADMIT_AFFINITY_MIN else ''}", flush=True)
++        return ranked[0][2]
++
+     SOLO_AGAIN_MAX = 2      # how often a request left alone in a slot goes back to the solo path
+     SOLO_AGAIN_MIN_LEFT = 32  # ... only with at least this many tokens still allowed (max_tokens)
+ 
+@@ -1780,9 +1846,10 @@ class StrataEngine:
+         out: list[int] = []
+         pending: list[int] = []
+         prompt, left = list(ids), int(max_new)
++        sig = prompt_sig(prompt) if ADMIT_AFFINITY else None   # topic signature for affinity admission
+         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
+         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
+-        ok = yield from self._take_control(cancel, len(prompt), new=True)
++        ok = yield from self._take_control(cancel, len(prompt), new=True, sig=sig)
+         if not ok:
+             return
+         holding, born = True, self.gen                  # (the engine it now has the control lines of)
+@@ -1929,7 +1996,7 @@ class StrataEngine:
+                     head = f"BGENI {slot} {left}{keys} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}"
+                     live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
+                             "state": "reading", "prompt_tokens": len(prompt), "prompt_read": 0, "generated": 0,
+-                            "started": time.time(), "first_token": None}
++                            "started": time.time(), "first_token": None, "sig": sig}
+                     deadline = getattr(cancel, "_strata_queue_deadline", None)
+                     if deadline is not None and time.monotonic() >= deadline:
+                         raise QueueWaitExpired("the inference queue wait deadline expired; retry later")
+@@ -8243,6 +8310,14 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
+         if not cfg:
+             ap.error("--engine strata needs --config")
+         cfg = with_component_engine(cfg)
++        # The serve-side admission order can be carried in the config: "env" reaches only the engine child,
++        # not this process (a config's STRATA_ADMIT_AFFINITY in "env" never worked here - set the key instead).
++        if cfg.get("admit_affinity"):
++            globals()["ADMIT_AFFINITY"] = True
++        if cfg.get("admit_affinity_debug"):
++            globals()["ADMIT_AFFINITY_DEBUG"] = True
++        if cfg.get("admit_affinity_min") is not None:
++            globals()["ADMIT_AFFINITY_MIN"] = float(cfg["admit_affinity_min"])
+         vision = None
+         # The engine's own environment. It carries the offline policy too: an engine that fetched a
+         # missing shard or a plugin would break the promise the flag makes.
+diff --git a/serve/test_admit_affinity.py b/serve/test_admit_affinity.py
+new file mode 100644
+index 0000000..4c7cf37
+--- /dev/null
++++ b/serve/test_admit_affinity.py
+@@ -0,0 +1,153 @@
++"""serve/test_admit_affinity.py - STRATA_ADMIT_AFFINITY: a new request on a slot's own topic takes the control
++lines before one on a new topic (StrataEngine._take_control / _admit_affinity; no process, no GPU).
++
++    python -m unittest serve.test_admit_affinity -v
++"""
++from __future__ import annotations
++
++import sys
++import threading
++import time
++import unittest
++from pathlib import Path
++from unittest import mock
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++import serve.server as server  # noqa: E402
++from serve.server import StrataEngine, prompt_sig, sig_match  # noqa: E402
++
++HEAD = list(range(24))                      # the shared chat-template head, not part of a signature
++BODY_A = list(range(100, 200))              # topic A's vocabulary
++BODY_B = list(range(1000, 1100))            # topic B's (disjoint)
++SIG_A = prompt_sig(HEAD + BODY_A)
++SIG_B = prompt_sig(HEAD + BODY_B)
++
++
++def engine_without_process(n=2):
++    """A StrataEngine with the admission state of a started one and no process: alive() is `e.up`."""
++    e = StrataEngine("missing-executable", [], lazy=True)
++    e.batch = n
++    e.slot_busy = [False] * n
++    e.slot_claims, e.slot_releasing, e._orphan_seen = set(), set(), {}
++    e.slot_cv = threading.Condition()
++    e.waiting, e.admitting, e.wait_lens, e.ctl_epoch = 0, 0, [], 0
++    e.slot_live = [None] * n
++    e.ctl = threading.Lock()
++    e.gen = 1
++    e.up = True
++    e.alive = lambda: e.up
++    return e
++
++
++def live(sig):
++    """A slot_live row as generate_batched writes it: only the signature matters here."""
++    return {"slot": 0, "request_id": 1, "state": "decoding", "prompt_tokens": 100, "prompt_read": 100,
++            "generated": 10, "started": time.time(), "first_token": time.time(), "sig": sig}
++
++
++class AdmitAffinityTest(unittest.TestCase):
++    def setUp(self):
++        self.e = engine_without_process(16)
++        self.order, self.cancels = [], []
++        self.order_lock = threading.Lock()
++
++    def tearDown(self):
++        for c in self.cancels:
++            c.set()
++
++    def take(self, name, plen, **kw):
++        """A request waiting for the control lines; once it has them it notes its name and gives them back."""
++        c = threading.Event()
++        self.cancels.append(c)
++
++        def go():
++            gen = self.e._take_control(c, plen, **kw)
++            try:
++                while True:
++                    next(gen)
++            except StopIteration as s:
++                if s.value:
++                    with self.order_lock:
++                        self.order.append(name)
++                    time.sleep(0.05)                # its read
++                    self.e.ctl.release()
++        threading.Thread(target=go, daemon=True).start()
++
++    def until(self, cond, s=5.0):
++        end = time.time() + s
++        while time.time() < end and not cond():
++            time.sleep(0.01)
++        self.assertTrue(cond())
++
++    def queue(self, *reqs):
++        """While a long read holds the control lines, the requests arrive in this order; then the read ends."""
++        self.assertTrue(self.e.ctl.acquire(timeout=1))
++        for name, plen, kw in reqs:
++            self.take(name, plen, **kw)
++            time.sleep(0.02)                        # (distinct arrival times)
++        self.until(lambda: self.e.waiting == len(reqs))
++        self.e.ctl.release()
++        self.until(lambda: len(self.order) == len(reqs), s=15.0)
++        return self.order
++
++    def test_same_topic_goes_first(self):
++        """A slot decodes topic A; a later A request passes an earlier B request."""
++        self.e.slot_live[0] = live(SIG_A)
++        with mock.patch.object(server, "ADMIT_AFFINITY", True), \
++                mock.patch.object(server, "ADMIT_MAX_WAIT_S", 60.0):
++            order = self.queue(("b", 4000, {"new": True, "sig": SIG_B}),
++                               ("a2", 4000, {"new": True, "sig": SIG_A}))
++        self.assertEqual(order, ["a2", "b"])
++
++    def test_fifo_when_slots_empty_or_signatureless(self):
++        """Nothing in the slots (or nothing with a signature): arrival order, as before."""
++        with mock.patch.object(server, "ADMIT_AFFINITY", True), \
++                mock.patch.object(server, "ADMIT_MAX_WAIT_S", 60.0):
++            order = self.queue(("b", 4000, {"new": True, "sig": SIG_B}),
++                               ("a", 4000, {"new": True, "sig": SIG_A}))
++        self.assertEqual(order, ["b", "a"])
++
++    def test_a_request_that_waited_too_long_goes_first(self):
++        """Fairness: past STRATA_ADMIT_MAX_WAIT_S a mismatched request counts as matching."""
++        self.e.slot_live[0] = live(SIG_A)
++        with mock.patch.object(server, "ADMIT_AFFINITY", True), \
++                mock.patch.object(server, "ADMIT_MAX_WAIT_S", 0.2):
++            self.assertTrue(self.e.ctl.acquire(timeout=1))
++            self.take("b", 4000, new=True, sig=SIG_B)
++            self.until(lambda: self.e.waiting == 1)
++            time.sleep(0.4)                         # past STRATA_ADMIT_MAX_WAIT_S
++            self.take("a2", 4000, new=True, sig=SIG_A)
++            self.until(lambda: self.e.waiting == 2)
++            self.e.ctl.release()
++            self.until(lambda: len(self.order) == 2, s=15.0)
++        self.assertEqual(self.order, ["b", "a2"])
++
++    def test_off_by_default(self):
++        self.assertEqual(server.ADMIT_AFFINITY if "STRATA_ADMIT_AFFINITY" not in __import__("os").environ
++                         else False, False)
++        self.e.slot_live[0] = live(SIG_A)
++        with mock.patch.object(server, "ADMIT_AFFINITY", False):
++            order = self.queue(("b", 4000, {"new": True, "sig": SIG_B}),
++                               ("a2", 4000, {"new": True, "sig": SIG_A}))
++        self.assertEqual(sorted(order), ["a2", "b"])            # both get their turn, in any order
++
++    def test_a_continuation_is_not_held_back(self):
++        """A request already admitted once (new=False: promoted from the solo path) is not part of the order."""
++        self.e.slot_live[0] = live(SIG_A)
++        with mock.patch.object(server, "ADMIT_AFFINITY", True), \
++                mock.patch.object(server, "ADMIT_MAX_WAIT_S", 60.0):
++            order = self.queue(("b", 4000, {"new": True, "sig": SIG_B}),
++                               ("continuation", 9000, {"sig": SIG_B}))
++        self.assertEqual(sorted(order), ["b", "continuation"])
++
++    def test_signature_basics(self):
++        self.assertIsNone(prompt_sig(list(range(10))))                    # no body to speak of
++        self.assertEqual(sig_match(SIG_A, prompt_sig(HEAD + BODY_A)), 1.0)
++        self.assertEqual(sig_match(SIG_A, SIG_B), 0.0)
++        self.assertEqual(sig_match(None, SIG_A), 0.0)
++        headless = prompt_sig(HEAD + BODY_A[:50])
++        self.assertGreater(sig_match(headless, SIG_A), 0.3)               # a shorter same-topic read still matches
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/src/core/conversation_l3.cpp b/src/core/conversation_l3.cpp
+new file mode 100644
+index 0000000..77b30ec
+--- /dev/null
++++ b/src/core/conversation_l3.cpp
+@@ -0,0 +1,298 @@
++#include "strata/core/conversation_l3.hpp"
++
++#include <algorithm>
++#include <cinttypes>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <fstream>
++#include <new>
++#include <system_error>
++
++namespace strata::core {
++
++namespace {
++
++// The sidecar holds only what find_best() matches on, so a scan never opens the (possibly huge) session file:
++// magic "STL3IDX\2", then u8 cvec, the live key, u64 checkpoint count and every checkpoint key; a key is u64 token
++// count, u64 ids hash, u64 image count and, per image, i64 start + u64 hash.  Host-endianness on purpose: the
++// archive is written and read by the same engine build.  Version 1 indexed only the live state; its sidecars are
++// refused (the live token list can end past the client's rendered history, so the checkpoints are what matches).
++const char kSidecarMagic[8] = {'S', 'T', 'L', '3', 'I', 'D', 'X', 2};
++const uint64_t kSidecarMaxImages = 1 << 20, kSidecarMaxCheckpoints = 1 << 16;
++
++uint64_t key_hash(const ConversationCheckpoint& c) {
++    return session_hash64(c.ids.data(), c.ids.size() * sizeof(int32_t), 0);
++}
++
++bool sidecar_put(std::ofstream& f, const void* p, size_t n) {
++    f.write((const char*) p, (std::streamsize) n);
++    return (bool) f;
++}
++
++bool sidecar_get(std::ifstream& f, void* p, size_t n) {
++    f.read((char*) p, (std::streamsize) n);
++    return (bool) f;
++}
++
++bool sidecar_put_key(std::ofstream& f, const ConversationL3Store::Key& k) {
++    const uint64_t n_imgs = k.imgs.size();
++    if (!sidecar_put(f, &k.tokens, 8) || !sidecar_put(f, &k.ids_hash, 8) || !sidecar_put(f, &n_imgs, 8))
++        return false;
++    for (const auto& img : k.imgs)
++        if (!sidecar_put(f, &img.start, 8) || !sidecar_put(f, &img.hash, 8)) return false;
++    return true;
++}
++
++bool sidecar_get_key(std::ifstream& f, ConversationL3Store::Key& k) {
++    uint64_t n_imgs = 0;
++    if (!sidecar_get(f, &k.tokens, 8) || !sidecar_get(f, &k.ids_hash, 8) || !sidecar_get(f, &n_imgs, 8) ||
++        n_imgs > kSidecarMaxImages)
++        return false;
++    k.imgs.clear();
++    k.imgs.reserve((size_t) n_imgs);
++    for (uint64_t i = 0; i < n_imgs; ++i) {
++        ConversationImageKey img;
++        if (!sidecar_get(f, &img.start, 8) || !sidecar_get(f, &img.hash, 8)) return false;
++        k.imgs.push_back(img);
++    }
++    return true;
++}
++
++} // namespace
++
++ConversationL3Store::ConversationL3Store(std::string dir, uint64_t budget_bytes, IdentityFn identity,
++                                         LimitsFn limits, LogFn log)
++    : dir_(std::move(dir)), budget_(budget_bytes), identity_(std::move(identity)), limits_(std::move(limits)),
++      log_(std::move(log)) {
++    if (dir_.empty()) return;
++    try {
++        scan();
++    } catch (const std::exception& e) {
++        // a scan failure must not keep the engine from starting: the archive just starts empty
++        say(std::string("scan of ") + dir_ + " failed: " + e.what());
++        entries_.clear();
++        bytes_ = 0;
++    }
++}
++
++void ConversationL3Store::scan() {
++    namespace fs = std::filesystem;
++    std::error_code ec;
++    fs::create_directories(dir_, ec);
++    ec.clear();
++    std::vector<std::pair<uint64_t, std::string>> found;   // (mtime ticks, path), so the LRU order survives a restart
++    fs::directory_iterator it(dir_, fs::directory_options::skip_permission_denied, ec), end;
++    while (!ec && it != end) {
++        const std::string name = it->path().filename().string();
++        if (name.rfind("strata-l3-", 0) == 0 && name.size() > 8 &&
++            name.compare(name.size() - 8, 8, ".session") == 0) {
++            std::error_code ec2;
++            const auto mtime = it->last_write_time(ec2);
++            if (!ec2) found.push_back({(uint64_t) mtime.time_since_epoch().count(), it->path().string()});
++        }
++        it.increment(ec);
++    }
++    std::sort(found.begin(), found.end());
++    for (const auto& f : found) {
++        Entry e;
++        if (!read_sidecar(f.second, e)) {
++            say("skipped " + f.second + " (no readable sidecar)");
++            continue;
++        }
++        std::error_code ec2;
++        const uint64_t sz = fs::file_size(f.second, ec2);
++        if (ec2) {
++            say("skipped " + f.second + " (cannot stat)");
++            continue;
++        }
++        e.path = f.second;
++        e.bytes = sz;
++        e.lru = ++clock_;
++        e.generation = generation_;
++        bytes_ += e.bytes;
++        entries_.push_back(std::move(e));
++    }
++    serial_ = entries_.size();
++    while (bytes_ > budget_ && !entries_.empty()) evict_lru();   // the budget shrank since these were written
++}
++
++bool ConversationL3Store::write_sidecar(const Entry& e, std::string& error) const {
++    namespace fs = std::filesystem;
++    const std::string side = sidecar_path(e.path);
++    const std::string tmp = side + ".tmp";
++    {
++        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
++        if (!f) { error = "cannot open " + tmp; return false; }
++        const uint8_t cv = e.cvec ? 1 : 0;
++        const uint64_t n_checks = e.checkpoints.size();
++        bool ok = sidecar_put(f, kSidecarMagic, 8) && sidecar_put(f, &cv, 1) && sidecar_put_key(f, e.live) &&
++                  sidecar_put(f, &n_checks, 8);
++        for (const Key& k : e.checkpoints) ok = ok && sidecar_put_key(f, k);
++        if (!ok) { error = "cannot write " + tmp; return false; }
++    }
++    std::error_code ec;
++    fs::rename(tmp, side, ec);
++    if (ec) {
++        error = "cannot rename the sidecar over " + side + ": " + ec.message();
++        fs::remove(tmp, ec);
++        return false;
++    }
++    return true;
++}
++
++bool ConversationL3Store::read_sidecar(const std::string& session_path, Entry& e) const {
++    std::ifstream f(sidecar_path(session_path), std::ios::binary);
++    if (!f) return false;
++    char magic[8];
++    uint8_t cv = 0;
++    uint64_t n_checks = 0;
++    if (!sidecar_get(f, magic, 8) || std::memcmp(magic, kSidecarMagic, 8) != 0) return false;
++    if (!sidecar_get(f, &cv, 1) || !sidecar_get_key(f, e.live) || !sidecar_get(f, &n_checks, 8) ||
++        n_checks > kSidecarMaxCheckpoints)
++        return false;
++    e.cvec = cv != 0;
++    e.checkpoints.clear();
++    e.checkpoints.reserve((size_t) n_checks);
++    for (uint64_t i = 0; i < n_checks; ++i) {
++        Key k;
++        if (!sidecar_get_key(f, k)) return false;
++        e.checkpoints.push_back(std::move(k));
++    }
++    char extra;
++    return !f.read(&extra, 1);   // a longer sidecar is not one this engine wrote
++}
++
++void ConversationL3Store::evict_lru() {
++    size_t oldest = 0;
++    for (size_t i = 1; i < entries_.size(); ++i)
++        if (entries_[i].lru < entries_[oldest].lru) oldest = i;
++    const Entry e = entries_[oldest];
++    std::error_code ec;
++    std::filesystem::remove(e.path, ec);
++    std::filesystem::remove(sidecar_path(e.path), ec);
++    bytes_ -= e.bytes;
++    entries_.erase(entries_.begin() + (std::ptrdiff_t) oldest);
++    say("evicted " + e.path + " (over budget)");
++}
++
++bool ConversationL3Store::archive(SavedConversation&& image) noexcept {
++    try {
++        if (!enabled()) return false;
++        if (!image.stage_images.empty()) {
++            say("not archived: a layer-split image (a session file holds one GPU's image)");
++            return false;
++        }
++        Entry e;
++        e.live.tokens = image.live.ids.size();
++        if (e.live.tokens == 0) return false;
++        e.live.ids_hash = key_hash(image.live);
++        e.live.imgs = image.live.imgs;
++        e.cvec = image.cvec;
++        e.checkpoints.reserve(image.checkpoints.size());
++        for (const auto& c : image.checkpoints) {
++            if (c.ids.empty()) continue;
++            Key k;
++            k.tokens = c.ids.size();
++            k.ids_hash = key_hash(c);
++            k.imgs = c.imgs;
++            e.checkpoints.push_back(std::move(k));
++        }
++        for (Entry& x : entries_) {
++            // the same state is already on disk (a restore -> park -> evict round of a conversation that did not
++            // advance): refresh it instead of writing the same bytes again
++            if (x.generation == generation_ && x.cvec == e.cvec && x.live.tokens == e.live.tokens &&
++                x.live.ids_hash == e.live.ids_hash && x.live.imgs == e.live.imgs) {
++                x.lru = ++clock_;
++                return true;
++            }
++        }
++        if (image.bytes() > budget_) {
++            say("not archived: the image exceeds the whole disk budget");
++            return false;
++        }
++        SessionFileIdentity id;
++        std::string error;
++        if (!identity_ || !identity_(id, error)) {
++            say("not archived: identity: " + error);
++            return false;
++        }
++        char name[160];
++        std::snprintf(name, sizeof name, "strata-l3-g%" PRIu64 "-%016" PRIx64 "-t%" PRIu64 "-s%" PRIu64 ".session",
++                      generation_, e.live.ids_hash, e.live.tokens, ++serial_);
++        e.path = dir_ + "/" + name;
++        size_t bytes = 0;
++        SessionStatus st;
++        if (!session_file_write(e.path, image, id, bytes, error, write_options, &st)) {
++            say("not archived: " + error);
++            std::error_code ec;
++            std::filesystem::remove(e.path, ec);   // a published-but-unflushed file too: it never joins the index
++            return false;
++        }
++        e.bytes = bytes;
++        e.lru = ++clock_;
++        e.generation = generation_;
++        if (!write_sidecar(e, error)) {
++            say("not archived: " + error);
++            std::error_code ec;
++            std::filesystem::remove(e.path, ec);
++            std::filesystem::remove(sidecar_path(e.path), ec);
++            return false;
++        }
++        const uint64_t mine = e.lru;
++        bytes_ += e.bytes;
++        say("archived " + std::to_string(e.live.tokens) + " tokens (" +
++            std::to_string(e.checkpoints.size()) + " checkpoints), " + std::to_string(bytes) + " bytes to " + e.path);
++        entries_.push_back(std::move(e));
++        while (bytes_ > budget_ && !entries_.empty()) evict_lru();   // the new file (the highest lru) goes last
++        for (const Entry& x : entries_)
++            if (x.lru == mine) return true;
++        return false;   // the budget could not hold even this one file (it went again)
++    } catch (const std::bad_alloc&) {
++        say("not archived: out of memory");
++        return false;
++    } catch (const std::exception& ex) {
++        say(std::string("not archived: ") + ex.what());
++        return false;
++    }
++}
++
++bool ConversationL3Store::load(const std::string& path, SavedConversation& image, std::string& error) noexcept {
++    try {
++        SessionFileIdentity id;
++        if (!identity_ || !identity_(id, error)) return false;
++        SessionReadLimits limits;
++        if (limits_ && !limits_(limits, error)) return false;
++        size_t bytes = 0;
++        SessionStatus st;
++        if (!session_file_read(path, id, image, bytes, error, limits, &st)) return false;
++        for (Entry& e : entries_)
++            if (e.path == path) { e.lru = ++clock_; break; }
++        return true;
++    } catch (const std::bad_alloc&) {
++        error = "out of memory while reading an archived conversation";
++        return false;
++    } catch (const std::exception& ex) {
++        error = ex.what();
++        return false;
++    }
++}
++
++void ConversationL3Store::bump_generation() noexcept {
++    try {
++        for (const Entry& e : entries_) {
++            std::error_code ec;
++            std::filesystem::remove(e.path, ec);
++            std::filesystem::remove(sidecar_path(e.path), ec);
++        }
++        const size_t n = entries_.size();
++        entries_.clear();
++        bytes_ = 0;
++        ++generation_;
++        if (n) say("invalidated " + std::to_string(n) + " archived conversation(s) after non-finite logits (#879)");
++    } catch (...) {
++        // invalidation is best-effort; a leftover file is out of the index and never matched again
++    }
++}
++
++} // namespace strata::core
+diff --git a/src/core/expert_cache.cpp b/src/core/expert_cache.cpp
+index bd98ad7..2c095d8 100644
+--- a/src/core/expert_cache.cpp
++++ b/src/core/expert_cache.cpp
+@@ -446,7 +446,7 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
+ #endif
+ }
+ 
+-#if defined(STRATA_USE_HIP)
++#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)  // gfx906 also needs pinned staging for pageable mmap sources (DTK hangs on direct pageable H2D)
+ bool ExpertCache::ensure_blocking_staging(std::size_t bytes, std::string& err) {
+     if (bytes <= blocking_staging_bytes_) return true;
+     void* next = nullptr;
+@@ -540,7 +540,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
+     n_layers_ = n_layers;
+     n_expert_ = n_expert;
+     blob_ = blob_bytes;
+-#if defined(STRATA_USE_HIP)
++#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)  // gfx906 also needs pinned staging for pageable mmap sources (DTK hangs on direct pageable H2D)
+     if (!ensure_blocking_staging((std::size_t) blob_, err)) {
+         close();
+         return false;
+@@ -578,7 +578,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
+     blob_ = mx;
+     off_ = std::move(off);
+     guard_ = guard_req_;
+-#if defined(STRATA_USE_HIP)
++#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)  // gfx906 also needs pinned staging for pageable mmap sources (DTK hangs on direct pageable H2D)
+     if (!ensure_blocking_staging((std::size_t) blob_, err)) {
+         close();
+         return false;
+@@ -596,7 +596,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
+ }
+ 
+ void ExpertCache::close() {
+-#if defined(STRATA_USE_HIP)
++#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)  // gfx906 also needs pinned staging for pageable mmap sources (DTK hangs on direct pageable H2D)
+     if (blocking_staging_) (void) cudaFreeHost(blocking_staging_);
+     blocking_staging_ = nullptr;
+     blocking_staging_bytes_ = 0;
+@@ -705,7 +705,7 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
+         err = "ExpertCache::fill_slot_blocking: the host blob is null";
+         return false;
+     }
+-#if defined(STRATA_USE_HIP)
++#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)  // gfx906 also needs pinned staging for pageable mmap sources (DTK hangs on direct pageable H2D)
+     // Bound HIP's pageable-source staging to one expert instead of repeatedly
+     // registering regions of the mmap. The blocking copy completes before reuse.
+     if (!blocking_staging_ || n > blocking_staging_bytes_) {
+diff --git a/src/kernels/cuda/iq_kernels.cu b/src/kernels/cuda/iq_kernels.cu
+index d2f2e34..78868f0 100644
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -2474,7 +2474,7 @@ __global__ void __launch_bounds__(256, MINB) expdec_gu_kernel(const unsigned lon
+                                                                             float* __restrict__ gate, float* __restrict__ up, int rb) {
+     const int ng = *n_groups;
+     if (blockIdx.y >= ng) return;
+-    __shared__ alignas(16) int4 s_u[ED_NC * 2 * ED_XB];
++    __shared__ int4 s_u[ED_NC * 2 * ED_XB] __attribute__((aligned(16)));
+     __shared__ float s_ds[ED_NC * ED_XB];
+     STRATA_SHARED_ALIGN16_U32(s_grid_buf, EdGrid<TG>::words);
+     const int tid = threadIdx.x;
+@@ -2661,7 +2661,7 @@ __global__ void __launch_bounds__(256, STRATA_EXPDEC_MINB) expdec_down_kernel(co
+     if (blockIdx.y >= ng) return;
+     constexpr int LANES = TD == 20 ? 8 : 16;
+     constexpr int RPP = (256 / LANES) * R;   // rows per pass
+-    __shared__ alignas(16) int4 s_u[ED_NC * 2 * ED_HB];
++    __shared__ int4 s_u[ED_NC * 2 * ED_HB] __attribute__((aligned(16)));
+     __shared__ float s_ds[ED_NC * ED_HB];
+     const int tid = threadIdx.x;
+     const int sw = tid / LANES, t = tid % LANES;
+diff --git a/src/kernels/mmvq_il_parity.cpp b/src/kernels/mmvq_il_parity.cpp
+index 9e78015..33e4f97 100644
+--- a/src/kernels/mmvq_il_parity.cpp
++++ b/src/kernels/mmvq_il_parity.cpp
+@@ -121,7 +121,9 @@ int run_case(const Case& c, bool bench, cudaStream_t s) {
+             return 1;
+         ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "copy x");
+         quantize_q8_1_rows(dx, T, c.n_in, xq, s);
++#if !defined(STRATA_HIP_GFX906)
+         if (T >= 2) native_q8_1_interleave(xq, xil, c.n_in, T, s);
++#endif  // HIP has no interleaved path (native_mmvq_il falls back to native_mmvq there)
+         native_mmvq(c.type, dw[0], xq, yref, c.n_in, c.n_out, T, s);
+         ck(cudaStreamSynchronize(s), "ref");
+         std::vector<uint32_t> a((std::size_t) T * c.n_out), b(a.size());
+@@ -301,7 +303,9 @@ int main(int argc, char** argv) {
+     cudaStream_t s;
+     cudaStreamCreate(&s);
+     int bad = 0;
+-    bad += check_tables();
++#if !defined(STRATA_HIP_GFX906)
++    bad += check_tables();   // CUDA-only IL tables; the HIP build ships none
++#endif
+     const char* only = std::getenv("MMVQ_IL_ONLY");   // 143-dense: only the cases whose name contains this
+     for (const Case& c : CASES)
+         if (only == nullptr || std::strstr(c.name, only) != nullptr) bad += run_case(c, bench, s);
+diff --git a/src/kernels/pf_wmma_parity.cpp b/src/kernels/pf_wmma_parity.cpp
+index bd4897c..c14959b 100644
+--- a/src/kernels/pf_wmma_parity.cpp
++++ b/src/kernels/pf_wmma_parity.cpp
+@@ -138,6 +138,11 @@ int run(int ty, int n_out, int K, std::mt19937& rng) {
+ }  // namespace
+ 
+ int main() {
++#if defined(STRATA_HIP_GFX906)
++    // gfx906 has no WMMA; gemm_iq_f16_grouped is not built. The engine uses the FP32 QSA fallback instead.
++    std::printf("%s", "pf_wmma_parity: no WMMA on gfx906, skipped.");
++    return 77;
++#endif
+     // every sm_70+ card in one process, in turn: a layer split launches the tiles on its second card after the first
+     int n_dev = 0, ran = 0, fails = 0;
+     cudaGetDeviceCount(&n_dev);
+diff --git a/src/kernels/verify_parity.cpp b/src/kernels/verify_parity.cpp
+index 26ff7e0..a0d6d2e 100644
+--- a/src/kernels/verify_parity.cpp
++++ b/src/kernels/verify_parity.cpp
+@@ -83,7 +83,14 @@ int test_argmax(std::mt19937& rng, cudaStream_t s) {
+             sample_tokens(d_l, rows, n, nullptr, 0, sp, d_ref, s);
+             row_top_prob(d_l, rows, n, d_ref, d_p1, s);
+             for (int rep = 0; rep < 3; ++rep) {
++#if defined(STRATA_HIP_GFX906) || defined(__HIPCC__)
++                // argmax_rows is the CUDA-only split kernel (#if !defined(__HIPCC__) in verify_kernels.cu);
++                // on HIP the engine keeps the one-block kernel, so mirror the reference into d_out and only
++                // exercise row_top_prob_split here.
++                check(cudaMemcpy(d_out, d_ref, rows * sizeof(int), cudaMemcpyDeviceToDevice), "argmax skip");
++#else
+                 argmax_rows(d_l, rows, n, sa, d_out, s);
++#endif
+                 row_top_prob_split(d_l, rows, n, d_out, d_p2, st, s);
+                 check(cudaStreamSynchronize(s), "argmax");
+                 const std::vector<int> ref = down(d_ref, rows);
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+index 7bafd68..2ef9861 100644
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -26,6 +26,7 @@
+ #include "strata/core/expert_cache.hpp"
+ #include "strata/core/conversation_snapshot.hpp"
+ #include "strata/core/conversation_file.hpp"
++#include "strata/core/conversation_l3.hpp"
+ #include "strata/core/session_save_reclaim.hpp"
+ #include "strata/core/conversation_memory.hpp"
+ #include "strata/core/coupled_draft.hpp"
+@@ -738,6 +739,12 @@ struct Options {
+     /// (drop_superseded) after writing the same bytes once more, so on a long single conversation every turn pays a
+     /// whole-snapshot copy for nothing.  0 = park every turn, as before.
+     int64_t conversation_cache_park_gain = 0;
++    /// --serve: SSD archive folder for the parked conversations the RAM cache evicts (the L3 layer,
++    /// conversation_l3.hpp): a cache miss with a longer archived prefix reads it back.  Session-file format (the
++    /// SAVE one), so a restarted engine picks the folder up again.  Empty (default) = off.
++    std::string conversation_disk_dir;
++    /// --serve: the L3 archive's size budget; over it the least recently used archived files are deleted.  0 = off.
++    int64_t conversation_disk_gib = 64;
+     /// --memory-limit-mib N / STRATA_MEMORY_LIMIT_MIB: the total RAM this engine's container or cgroup may use, for a
+     /// container that cannot see its real limit (0 or unset = none; the flag wins over the variable)
+     int64_t memory_limit_mib = -1;
+@@ -902,6 +909,11 @@ void usage() {
+                  "  --conversation-cache-park-gain N  --serve: park only after the conversation advanced N tokens past\n"
+                  "                       the copy it would supersede, so a turn that grew by a few hundred tokens does not\n"
+                  "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
++                 "  --conversation-disk-dir PATH  --serve: SSD archive for parked conversations the RAM cache\n"
++                 "                       evicts (L3): a cache miss with a longer archived prefix reads it back from\n"
++                 "                       PATH.  Session-file format, so a restarted engine keeps it.  Empty (default) = off\n"
++                 "  --conversation-disk-gib N  --serve: the L3 archive's size budget in GiB; over it the least recently\n"
++                 "                       used archived files go (default 64; 0 = off)\n"
+                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
+                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
+                  "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
+@@ -2640,7 +2652,7 @@ int main(int argc, char** argv) {
+         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
+         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
+                  a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
+-                 a == "--conversation-cache-park-gain" ||
++                 a == "--conversation-cache-park-gain" || a == "--conversation-disk-gib" ||
+                  a == "--session-min-free-mib" || a == "--memory-limit-mib") {
+             const std::string value = next(a.c_str());
+             int64_t number = 0;
+@@ -2656,10 +2668,12 @@ int main(int argc, char** argv) {
+             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
+             else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = number;
+             else if (a == "--conversation-cache-park-gain") o.conversation_cache_park_gain = number;
++            else if (a == "--conversation-disk-gib") o.conversation_disk_gib = std::min<int64_t>(number, 1LL << 24);
+             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
+             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
+             else o.conversation_cache_slots = (int) number;
+         }
++        else if (a == "--conversation-disk-dir") o.conversation_disk_dir = next("--conversation-disk-dir");
+         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
+         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
+         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
+@@ -9465,6 +9479,54 @@ int main(int argc, char** argv) {
+             id.config = *config_fp;
+             return true;
+         };
++        // L3 SSD archive of parked conversations (--conversation-disk-dir, conversation_l3.hpp).  The RAM cache
++        // hands its evictions to the store (ConversationCache::on_archive); a miss with a longer archived prefix
++        // reads it back at the conversations.best() call site below.  Identity and read limits are the
++        // SAVE/RESTORE ones, so an archived file is exactly a session file and a restart picks the folder up
++        // again.  Single-GPU only, as for session files: a layer split's stage images are not archived.
++        std::unique_ptr<strata::core::ConversationL3Store> conversation_disk;
++        if (!o.conversation_disk_dir.empty() && o.conversation_disk_gib > 0 && conversations.enabled() &&
++            stages.empty()) {
++            conversation_disk = std::make_unique<strata::core::ConversationL3Store>(
++                o.conversation_disk_dir, (uint64_t) o.conversation_disk_gib << 30,
++                [&](strata::core::SessionFileIdentity& id, std::string& e) { return session_identity(id, e, {}); },
++                [&](strata::core::SessionReadLimits& limits, std::string& e) {
++                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
++                    limits.admit = [floor, &o](uint64_t need, std::string& why) {
++                        const auto mem = strata::core::sample_host_memory();
++                        const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
++                        if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
++                        why = "not enough RAM to read an archived conversation (" + std::to_string(need >> 20) +
++                              " MiB plus a floor of " + std::to_string((long long) o.conversation_cache_min_free_mib) +
++                              " MiB needed, " + ram_note(mem) + ")";
++                        return false;
++                    };
++                    // a block moved: the ordinary watchdog limit again, without a protocol line (this is a request)
++                    limits.progress = [](uint64_t done, uint64_t) {
++                        strata::core::progress_at("request: reading an archived conversation, MiB", (int64_t) (done >> 20));
++                        strata::core::progress_allow(0);
++                    };
++                    return strata::core::conversation_session_read_limits(limits, ss, g, mtp.kv_state(),
++                                                                          (uint64_t) o.max_context,
++                                                                          (uint64_t) std::max(o.prompt_cache, 1), e);
++                },
++                [](const std::string& m) { std::fprintf(stderr, "strata serve: conversation disk: %s\n", m.c_str()); });
++            conversation_disk->write_options.progress = [](uint64_t done, uint64_t) {
++                strata::core::progress_at("request: archiving a conversation to disk, MiB", (int64_t) (done >> 20));
++                strata::core::progress_allow(0);
++            };
++            conversation_disk->write_options.phase = [](const char* phase, uint64_t bytes) {
++                strata::core::progress_at(phase);
++                strata::core::progress_allow(strata::core::session_phase_limit_s(bytes));
++            };
++            conversations.on_archive = [&conversation_disk](strata::core::SavedConversation&& image) {
++                conversation_disk->archive(std::move(image));
++            };
++            std::fprintf(stderr, "strata serve: conversation disk: %s: budget %lld GiB, %zu archived conversation%s, "
++                                 "%llu bytes\n", o.conversation_disk_dir.c_str(), (long long) o.conversation_disk_gib,
++                         conversation_disk->size(), conversation_disk->size() == 1 ? "" : "s",
++                         (unsigned long long) conversation_disk->bytes());
++        }
+         // Save only on a switch/rewind, not on each continuing request. No graph
+         // addresses change: all parked images live in ordinary host vectors.
+         auto park_current_body = [&](size_t held) -> bool {
+@@ -12272,6 +12334,7 @@ int main(int argc, char** argv) {
+                     if (nan_flush) {   // #879: the file replaced the poisoned session; the parked ones go (no slots here)
+                         nan_flush = false;
+                         const size_t n_parked = conversations.clear();
++                        if (conversation_disk) conversation_disk->bump_generation();   // the archive may hold the poison too
+                         std::fprintf(stderr, "strata serve: after non-finite logits (#879): the restored session "
+                                              "replaces the live one; dropped %zu parked conversation%s\n", n_parked,
+                                      n_parked == 1 ? "" : "s");
+@@ -12560,6 +12623,7 @@ int main(int argc, char** argv) {
+                 checks.clear();
+                 tail_ckpt_len = -1;
+                 const size_t n_parked = conversations.clear();
++                if (conversation_disk) conversation_disk->bump_generation();   // the archive may hold the poison too
+                 size_t n_slots = 0, n_running = 0;
+                 for (BSlot& sl : bs)
+                     if (sl.active) {   // a running slot finishes its reply, but is not kept as a cache after it
+@@ -12680,7 +12744,61 @@ int main(int argc, char** argv) {
+                                  k + 1, (long long) (k < now.size() ? now[k].start : -1));
+                 }
+             }
+-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
++            auto parked = conversations.best(ids, req_imgs, want_cvec);
++            // L3 SSD archive: the live session, the checkpoints, the batch slots and the RAM cache all lack more
++            // of this prompt - but the archive may hold the conversation from before an eviction or a restart.  A
++            // hit is read back, checked like any incoming image, and put into the RAM cache (its make_room may
++            // evict other parked conversations, which archive again: the L2<->L3 swap); then best() runs again.
++            if (conversation_disk && parked.tokens <= std::max(resume, slot_tokens)) {
++                std::string disk_path;
++                const int64_t disk_tokens = conversation_disk->find_best(ids, req_imgs, want_cvec, disk_path);
++                if (disk_tokens > std::max(resume, slot_tokens)) {
++                    const auto t0 = Clock::now();
++                    try {
++                        strata::core::SavedConversation archived;
++                        bool ok = conversation_disk->load(disk_path, archived, err);
++                        // the index matched on 64-bit hashes: check the loaded image's tokens exactly (and its
++                        // steering) before it enters the RAM cache - the matched prefix may be its live state or
++                        // one of its checkpoints (the live list can end past the client's rendered history)
++                        if (ok && archived.cvec != want_cvec) {
++                            err = "the archived image has another control-vector state";
++                            ok = false;
++                        }
++                        if (ok) {
++                            int64_t exact = strata::core::conversation_prefix(archived.live, ids, req_imgs);
++                            for (const auto& c : archived.checkpoints)
++                                exact = std::max(exact, strata::core::conversation_prefix(c, ids, req_imgs));
++                            if (exact != disk_tokens) {
++                                err = "the archived image does not hold the indexed prefix";
++                                ok = false;
++                            }
++                        }
++                        if (ok && !strata::core::conversation_snapshot_validate(archived, ss, g,
++                                use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err)) ok = false;
++                        if (ok) {
++                            if (conversations.put(std::move(archived))) {
++                                parked = conversations.best(ids, req_imgs, want_cvec);
++                                std::fprintf(stderr, "strata serve: conversation disk: restored %lld tokens from %s "
++                                             "into the RAM cache in %.1f ms; parked=%zu bytes=%zu\n",
++                                             (long long) disk_tokens, disk_path.c_str(),
++                                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
++                                             conversations.size(), conversations.bytes());
++                            } else {
++                                err = "the archived image does not fit the RAM cache budget";
++                                ok = false;
++                            }
++                        }
++                        if (!ok) {
++                            std::fprintf(stderr, "strata serve: conversation disk: cannot use %s: %s\n",
++                                         disk_path.c_str(), err.c_str());
++                            err.clear();
++                        }
++                    } catch (const std::bad_alloc&) {
++                        std::fprintf(stderr, "strata serve: conversation disk: allocation failed; not restored\n");
++                        err.clear();
++                    }
++                }
++            }
+             std::optional<strata::core::SavedConversation> incoming;
+             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
+             // borrowed: its K/V up to there and the checkpoint come over, and that conversation stays parked for its

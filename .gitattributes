@@ -1,0 +1,2 @@
+# Raw patches preserve upstream whitespace for faithful application.
+patches/**/*.patch whitespace=-trailing-space
