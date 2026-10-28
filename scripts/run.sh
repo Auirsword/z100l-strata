@@ -25,8 +25,12 @@ fi
 [[ "$PUBLISH_HOST" == 127.0.0.1 || "$PUBLISH_HOST" == ::1 ]] ||
     info "warning: the unauthenticated development endpoint will listen on $PUBLISH_HOST"
 groups=()
-getent group video >/dev/null 2>&1 && groups+=(--group-add video)
-getent group render >/dev/null 2>&1 && groups+=(--group-add render)
+if gid=$(getent group video | cut -d: -f3) && [[ $gid =~ ^[0-9]+$ ]]; then
+    groups+=(--group-add "$gid")
+fi
+if gid=$(getent group render | cut -d: -f3) && [[ $gid =~ ^[0-9]+$ ]]; then
+    groups+=(--group-add "$gid")
+fi
 publish_binding="$PUBLISH_HOST:$PORT:18080"
 [[ "$PUBLISH_HOST" != *:* ]] || publish_binding="[$PUBLISH_HOST]:$PORT:18080"
 exec docker run -d --name "$CONTAINER" --restart "$RESTART_POLICY" \
