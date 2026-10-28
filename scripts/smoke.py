@@ -26,7 +26,7 @@ def main():
             if health.get("loaded") and health.get("status") == "ok":
                 break
             error = "engine is not loaded"
-        except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+        except (HTTPError, URLError, TimeoutError, ValueError, ConnectionError) as exc:
             error = str(exc)
         if time.monotonic() >= deadline:
             raise SystemExit(f"health check failed: {error}")
