@@ -43,4 +43,4 @@ ENV PATH="/opt/venv/bin:/opt/strata/bin:$PATH" \
 WORKDIR /opt/strata/src
 EXPOSE 18080
 ENTRYPOINT ["/opt/strata/bin/entrypoint.sh"]
-CMD ["/opt/venv/bin/python", "-m", "serve.server", "--engine", "strata", "--config", "/state/config/serve.json"]
+CMD ["/opt/venv/bin/python", "-m", "serve.server", "--engine", "strata", "--config", "/state/config/serve.json", "--port", "18080"]

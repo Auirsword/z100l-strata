@@ -17,6 +17,13 @@ class ReleaseTest(unittest.TestCase):
             self.assertNotIn("--network=host", text)
             self.assertNotIn("--cap-add", text)
 
+    def test_packaged_server_binds_the_advertised_port(self):
+        dockerfile = (ROOT / "docker/Dockerfile").read_text()
+        self.assertIn('"--port", "18080"', dockerfile)
+        stop = (ROOT / "scripts/stop.sh").read_text()
+        self.assertIn("docker kill --signal=SIGTERM", stop)
+        self.assertNotIn("SIGKILL", stop)
+
     def test_dtk_apparmor_profile_keeps_container_boundaries(self):
         profile = (ROOT / "security/z100l-strata.apparmor").read_text()
         self.assertIn("profile z100l-strata", profile)

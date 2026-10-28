@@ -34,7 +34,14 @@ fetch() {
         git -C "$destination" remote add origin "$url"
     fi
     if ! git -C "$destination" cat-file -e "$revision^{commit}" 2>/dev/null; then
-        git -C "$destination" fetch --depth 1 origin "$revision"
+        for attempt in 1 2 3; do
+            if git -C "$destination" -c http.version=HTTP/1.1 fetch --depth 1 origin "$revision"; then
+                break
+            fi
+            (( attempt < 3 )) || die "failed to fetch pinned source from $url"
+            info "source download interrupted; retrying ($((attempt + 1))/3)"
+            sleep "$((attempt * 2))"
+        done
     fi
     git -C "$destination" diff --quiet || die "$destination has uncommitted changes; use a fresh source directory"
     git -C "$destination" checkout --detach --quiet "$revision"
