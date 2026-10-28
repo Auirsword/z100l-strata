@@ -31,6 +31,8 @@ COPY --from=build /opt/strata/src /opt/strata/src
 COPY --from=build /opt/strata/build/strata /opt/strata/bin/strata
 COPY --from=build /opt/strata/build/strata-device /opt/strata/bin/strata-device
 COPY docker/entrypoint.sh /opt/strata/bin/entrypoint.sh
+# The text-only runtime gets its model through a separate read-only mount.
+RUN find /opt/strata/src -type f -name '*.gguf' -delete
 RUN python3 -m venv /opt/venv && \
     /opt/venv/bin/pip install --no-cache-dir -r /opt/strata/src/requirements.txt && \
     chmod 0755 /opt/strata/bin/entrypoint.sh && mkdir -p /state/logs /state/conversations
