@@ -14,7 +14,7 @@ RUN --mount=type=bind,from=dtk,target=/opt/dtk,readonly \
     cmake -S /opt/strata/src -B /opt/strata/build -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
       -DSTRATA_HIP_GFX906=ON -DCMAKE_HIP_ARCHITECTURES=gfx906 \
-      -DSTRATA_BUILD_TESTS=ON -DSTRATA_NATIVE_EXPERTS=ON \
+      -DSTRATA_BUILD_TESTS=OFF -DSTRATA_NATIVE_EXPERTS=ON \
       -DSTRATA_GGML_DIR=/opt/llama.cpp \
       -DCMAKE_C_COMPILER=/opt/dtk/llvm/bin/clang \
       -DCMAKE_CXX_COMPILER=/opt/dtk/llvm/bin/clang++ \
@@ -39,7 +39,7 @@ RUN python3 -m venv /opt/venv && \
 ENV PATH="/opt/venv/bin:/opt/strata/bin:$PATH" \
     PYTHONPATH="/opt/strata/src" \
     ROCM_PATH=/opt/dtk HIP_PATH=/opt/dtk/hip HSA_PATH=/opt/dtk/hsa \
-    HOME=/state
+    AMDGPU_TARGETS=gfx906 HOME=/state
 WORKDIR /opt/strata/src
 EXPOSE 18080
 ENTRYPOINT ["/opt/strata/bin/entrypoint.sh"]

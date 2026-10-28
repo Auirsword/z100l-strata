@@ -46,5 +46,6 @@ exec docker run -d --name "$CONTAINER" --restart "$RESTART_POLICY" \
     --mount "type=bind,source=$MODEL_DIR,target=/model,readonly" \
     --mount "type=bind,source=$DATA_DIR,target=/state" \
     --env "HIP_VISIBLE_DEVICES=$GPU_ID" --env "CUDA_VISIBLE_DEVICES=$GPU_ID" \
+    --env "AMDGPU_TARGETS=$AMDGPU_TARGETS" \
     --log-opt max-size=32m --log-opt max-file=2 \
     "$IMAGE"
